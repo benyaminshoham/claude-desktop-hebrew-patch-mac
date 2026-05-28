@@ -55,9 +55,8 @@ npm install @electron/asar >/dev/null 2>&1
 echo "Extracting app.asar..."
 npx asar extract "$ASAR" "$UNPACKED"
 
-RTL_JS_FILE="$WORKDIR/rtl-patch.js"
-
-cat > "$RTL_JS_FILE" <<'JS'
+# ─── RTL patch JavaScript ────────────────────────────────────────────────────
+RTL_JS_SNIPPET=$(cat <<'JS'
 // CLAUDE_RTL_HEBREW_PATCH_START
 (function () {
   if (typeof document === "undefined") return;
@@ -65,14 +64,14 @@ cat > "$RTL_JS_FILE" <<'JS'
   window.__claudeRtlHebrewPatchInstalled = true;
 
   function hasRTL(text) {
-    return /[\u0590-\u05FF\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/.test(text || "");
+    return /[֐-׿؀-ۿݐ-ݿࢠ-ࣿ]/.test(text || "");
   }
 
   function firstStrongDirection(text) {
     text = text || "";
     for (var i = 0; i < text.length; i++) {
       var ch = text[i];
-      if (/[\u0590-\u05FF\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/.test(ch)) return "rtl";
+      if (/[֐-׿؀-ۿݐ-ݿࢠ-ࣿ]/.test(ch)) return "rtl";
       if (/[A-Za-z]/.test(ch)) return "ltr";
     }
     return null;
@@ -129,30 +128,12 @@ cat > "$RTL_JS_FILE" <<'JS'
 
     var style = document.createElement("style");
     style.id = "claude-rtl-hebrew-style";
-    style.textContent = `
-      [dir="rtl"] {
-        direction: rtl !important;
-        text-align: right !important;
-      }
-
-      [dir="ltr"],
-      pre,
-      code,
-      .cm-editor,
-      [class*="code"],
-      [class*="Code"] {
-        direction: ltr !important;
-        text-align: left !important;
-      }
-
-      p, li, blockquote, td, th {
-        unicode-bidi: plaintext !important;
-      }
-
-      pre, code {
-        unicode-bidi: embed !important;
-      }
-    `;
+    style.textContent = [
+      '[dir="rtl"] { direction: rtl !important; text-align: right !important; }',
+      '[dir="ltr"], pre, code, .cm-editor, [class*="code"], [class*="Code"] { direction: ltr !important; text-align: left !important; }',
+      'p, li, blockquote, td, th { unicode-bidi: plaintext !important; }',
+      'pre, code { unicode-bidi: embed !important; }'
+    ].join("\n");
     document.head.appendChild(style);
   }
 
@@ -175,12 +156,15 @@ cat > "$RTL_JS_FILE" <<'JS'
     }, true);
 
     var timer = null;
+    var body = document.body;
+    if (!body) return;
+
     var observer = new MutationObserver(function () {
       clearTimeout(timer);
       timer = setTimeout(run, 80);
     });
 
-    observer.observe(document.body, {
+    observer.observe(body, {
       childList: true,
       subtree: true,
       characterData: true
@@ -195,46 +179,74 @@ cat > "$RTL_JS_FILE" <<'JS'
 })();
 // CLAUDE_RTL_HEBREW_PATCH_END
 JS
-
-echo "Finding JavaScript injection targets..."
-
-TARGETS=()
-
-if [ -f "$UNPACKED/.vite/build/mainView.js" ]; then
-  TARGETS+=("$UNPACKED/.vite/build/mainView.js")
-fi
-
-while IFS= read -r JS_FILE; do
-  TARGETS+=("$JS_FILE")
-done < <(
-  find "$UNPACKED/.vite/renderer/main_window" -type f -name "*.js" 2>/dev/null \
-  | grep -E 'MainWindowPage|main|index' \
-  | head -n 5
 )
 
-if [ "${#TARGETS[@]}" -eq 0 ]; then
-  fail "No JavaScript targets found"
+# ─── Target 1: mainView.js (Electron preload for the claude.ai webview) ──────
+#
+# This script runs inside the WebView that loads claude.ai (the conversation
+# pane). Patching it here fixes RTL in actual chat messages and input fields.
+# We deliberately do NOT touch the renderer JS bundles (main-*.js,
+# MainWindowPage-*.js) because those power the co-work shell and sidebar —
+# modifying them breaks co-work.
+
+PRELOAD="$UNPACKED/.vite/build/mainView.js"
+PRELOAD_PATCHED=0
+
+if [ -f "$PRELOAD" ]; then
+  if grep -q "CLAUDE_RTL_HEBREW_PATCH_START" "$PRELOAD"; then
+    echo "mainView.js: already patched, skipping"
+    PRELOAD_PATCHED=1
+  else
+    TMP_JS="$WORKDIR/tmp-preload.js"
+    printf '%s\n' "$RTL_JS_SNIPPET" > "$TMP_JS"
+    cat "$PRELOAD" >> "$TMP_JS"
+    mv "$TMP_JS" "$PRELOAD"
+    echo "Patched preload: $PRELOAD"
+    PRELOAD_PATCHED=1
+  fi
+else
+  echo "WARNING: mainView.js not found — skipping preload patch"
 fi
 
-echo "Targets:"
-printf '%s\n' "${TARGETS[@]}"
+# ─── Target 2: index.html (shell app — co-work sidebar & local UI) ────────────
+#
+# The shell UI (co-work panel, history, sidebar) is served from app://localhost
+# and renders from index.html + main-*.js. Instead of patching the large JS
+# bundle (which would break co-work), we inject a tiny inline <script> into
+# the HTML <head>. The script is deferred until DOMContentLoaded so it runs
+# safely after the shell framework has initialized.
 
-PATCHED=0
+INDEX_HTML="$UNPACKED/.vite/renderer/main_window/index.html"
+HTML_PATCHED=0
 
-for JS_FILE in "${TARGETS[@]}"; do
-  if grep -q "CLAUDE_RTL_HEBREW_PATCH_START" "$JS_FILE"; then
-    echo "Already patched: $JS_FILE"
-    continue
+if [ -f "$INDEX_HTML" ]; then
+  if grep -q "CLAUDE_RTL_HEBREW_PATCH_START" "$INDEX_HTML"; then
+    echo "index.html: already patched, skipping"
+    HTML_PATCHED=1
+  else
+    # Build the inline script block (no backtick template literals so it
+    # embeds cleanly inside double-quoted HTML attributes if needed).
+    INLINE_SCRIPT="<script id=\"claude-rtl-inject\">/* CLAUDE_RTL_HEBREW_PATCH_START */${RTL_JS_SNIPPET}/* CLAUDE_RTL_HEBREW_PATCH_END */</script>"
+
+    # Insert the inline script just before </head>
+    perl -0pi -e 's|</head>|'"$(printf '%s' "$INLINE_SCRIPT" | perl -pe 's|[/\\]|\\$&|g')"'\n</head>|' "$INDEX_HTML" 2>/dev/null || true
+
+    # Verify injection worked
+    if grep -q "CLAUDE_RTL_HEBREW_PATCH_START" "$INDEX_HTML"; then
+      echo "Patched shell HTML: $INDEX_HTML"
+      HTML_PATCHED=1
+    else
+      echo "WARNING: HTML injection failed — falling back to safe append"
+      # Safe fallback: append before </body> instead
+      sed -i '' "s|</body>|<script id=\"claude-rtl-inject-fb\">/* CLAUDE_RTL_HEBREW_PATCH_START */${RTL_JS_SNIPPET}/* CLAUDE_RTL_HEBREW_PATCH_END */</script></body>|" "$INDEX_HTML" || true
+      grep -q "CLAUDE_RTL_HEBREW_PATCH_START" "$INDEX_HTML" && HTML_PATCHED=1
+    fi
   fi
+else
+  echo "WARNING: index.html not found — skipping shell HTML patch"
+fi
 
-  TMP_JS="$WORKDIR/tmp-js"
-  cat "$RTL_JS_FILE" "$JS_FILE" > "$TMP_JS"
-  mv "$TMP_JS" "$JS_FILE"
-  echo "Patched: $JS_FILE"
-  PATCHED=$((PATCHED + 1))
-done
-
-[ "$PATCHED" -gt 0 ] || fail "No files were patched"
+[ "$PRELOAD_PATCHED" -gt 0 ] || [ "$HTML_PATCHED" -gt 0 ] || fail "Nothing was patched"
 
 echo "Packing new app.asar..."
 npx asar pack "$UNPACKED" "$NEW_ASAR" --unpack "{*.node,spawn-helper}"
@@ -268,8 +280,6 @@ echo "Replacing app.asar..."
 sudo cp "$NEW_ASAR" "$ASAR"
 
 echo "Updating ElectronAsarIntegrity in Info.plist files..."
-
-UPDATED=0
 
 find "$APP_PATH" -name "Info.plist" -print0 | while IFS= read -r -d '' PLIST; do
   if sudo /usr/libexec/PlistBuddy -c "Print :ElectronAsarIntegrity:Resources/app.asar:hash" "$PLIST" >/dev/null 2>&1; then
