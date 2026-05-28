@@ -63,18 +63,35 @@ RTL_JS_SNIPPET=$(cat <<'JS'
   if (window.__claudeRtlHebrewPatchInstalled) return;
   window.__claudeRtlHebrewPatchInstalled = true;
 
+  // Hebrew / Arabic Unicode ranges (using \u escapes for bash-safe embedding)
+  var RTL_RE = /[֐-׿؀-ۿݐ-ݿࢠ-ࣿ]/;
+
   function hasRTL(text) {
-    return /[֐-׿؀-ۿݐ-ݿࢠ-ࣿ]/.test(text || "");
+    return RTL_RE.test(text || "");
   }
 
   function firstStrongDirection(text) {
     text = text || "";
     for (var i = 0; i < text.length; i++) {
-      var ch = text[i];
-      if (/[֐-׿؀-ۿݐ-ݿࢠ-ࣿ]/.test(ch)) return "rtl";
-      if (/[A-Za-z]/.test(ch)) return "ltr";
+      var cp = text.charCodeAt(i);
+      if ((cp >= 0x0590 && cp <= 0x05FF) || (cp >= 0x0600 && cp <= 0x06FF) ||
+          (cp >= 0x0750 && cp <= 0x077F) || (cp >= 0x08A0 && cp <= 0x08FF)) return "rtl";
+      if ((cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)) return "ltr";
     }
     return null;
+  }
+
+  // Return the text of an element with all inline-code content stripped out.
+  // This prevents a <p> or <li> from being classified RTL just because it
+  // contains an inline <code> snippet that happens to have Hebrew in it.
+  function nonCodeText(el) {
+    var clone = el.cloneNode(true);
+    var codeEls = clone.querySelectorAll("code, kbd, samp, var");
+    for (var i = 0; i < codeEls.length; i++) {
+      var c = codeEls[i];
+      if (c.parentNode) c.parentNode.removeChild(c);
+    }
+    return clone.innerText || clone.textContent || "";
   }
 
   function setDir(el, dir) {
@@ -85,8 +102,12 @@ RTL_JS_SNIPPET=$(cat <<'JS'
     el.style.unicodeBidi = "plaintext";
   }
 
+  // Force every code-related element (and all its descendants) to LTR.
+  // Runs unconditionally after processText so it overrides any RTL that
+  // claude.ai's own bidi logic or the browser may have applied to code nodes.
+  var CODE_SELECTOR = "pre, code, .cm-editor, [class*='code'], [class*='Code']";
   function forceCodeLTR(root) {
-    root.querySelectorAll("pre, code, .cm-editor, [class*='code'], [class*='Code']").forEach(function (el) {
+    root.querySelectorAll(CODE_SELECTOR).forEach(function (el) {
       el.setAttribute("dir", "ltr");
       el.style.direction = "ltr";
       el.style.textAlign = "left";
@@ -99,9 +120,13 @@ RTL_JS_SNIPPET=$(cat <<'JS'
     if (!root || !root.querySelectorAll) return;
 
     root.querySelectorAll("p, li, blockquote, td, th, h1, h2, h3, h4, h5, h6").forEach(function (el) {
-      if (el.closest("pre, code, .cm-editor, [class*='code'], [class*='Code']")) return;
+      // Skip elements that are themselves inside a code block
+      if (el.closest(CODE_SELECTOR)) return;
 
-      var text = el.innerText || el.textContent || "";
+      // Use only the non-code portion of the text for RTL detection.
+      // Without this, a paragraph like "Run `print('שלום')` to greet" would
+      // incorrectly get dir=rtl because the Hebrew is inside an inline <code>.
+      var text = nonCodeText(el);
       if (!hasRTL(text)) return;
 
       setDir(el, "rtl");
@@ -120,6 +145,7 @@ RTL_JS_SNIPPET=$(cat <<'JS'
       if (dir) setDir(el, dir);
     });
 
+    // Always run last — resets any stray RTL that landed on code elements
     forceCodeLTR(root);
   }
 
@@ -129,10 +155,28 @@ RTL_JS_SNIPPET=$(cat <<'JS'
     var style = document.createElement("style");
     style.id = "claude-rtl-hebrew-style";
     style.textContent = [
-      '[dir="rtl"] { direction: rtl !important; text-align: right !important; }',
-      '[dir="ltr"], pre, code, .cm-editor, [class*="code"], [class*="Code"] { direction: ltr !important; text-align: left !important; }',
-      'p, li, blockquote, td, th { unicode-bidi: plaintext !important; }',
-      'pre, code { unicode-bidi: embed !important; }'
+      // RTL rule scoped only to text-block element types we explicitly mark.
+      // Using element+attr selectors (specificity 11) instead of a bare
+      // [dir="rtl"] attribute selector (specificity 10) means this rule can
+      // NEVER accidentally fire on <pre> or <code> elements, even if they
+      // happen to carry a dir="rtl" attribute set by claude.ai's own logic.
+      "p[dir='rtl'],li[dir='rtl'],blockquote[dir='rtl']," +
+      "td[dir='rtl'],th[dir='rtl']," +
+      "h1[dir='rtl'],h2[dir='rtl'],h3[dir='rtl']," +
+      "h4[dir='rtl'],h5[dir='rtl'],h6[dir='rtl'] " +
+      "{ direction: rtl !important; text-align: right !important; }",
+
+      // LTR lock for all code elements and their entire subtrees.
+      // pre *, code * catches every token span, line element, etc.
+      // that syntax highlighters nest inside code blocks.
+      "[dir='ltr'], pre, code, pre *, code *, .cm-editor, " +
+      "[class*='code'], [class*='Code'] " +
+      "{ direction: ltr !important; text-align: left !important; }",
+
+      "p[dir='rtl'],li[dir='rtl'],blockquote[dir='rtl']," +
+      "td[dir='rtl'],th[dir='rtl'] { unicode-bidi: plaintext !important; }",
+
+      "pre, code, pre *, code * { unicode-bidi: embed !important; }"
     ].join("\n");
     document.head.appendChild(style);
   }
