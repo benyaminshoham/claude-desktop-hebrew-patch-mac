@@ -38,7 +38,7 @@ find "$BACKUP_DIR" -name "Info.plist" -print0 | while IFS= read -r -d '' BACKUP_
   [ -f "$DEST" ] && sudo cp "$BACKUP_PLIST" "$DEST"
 done
 
-sudo codesign --force --deep --sign - "$APP_PATH"
+sudo xattr -cr "$APP_PATH" 2>/dev/null || true
 
 echo "Restored Claude from:"
 echo "$BACKUP_DIR"

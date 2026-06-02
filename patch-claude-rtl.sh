@@ -139,6 +139,23 @@ RTL_JS_SNIPPET=$(cat <<'JS'
       }
     });
 
+    // Fix table column order: if the majority of cells are RTL, set dir="rtl"
+    // on the <table> itself. Cell-level dir only right-aligns text; table-level
+    // dir is what actually reverses the visual column order.
+    root.querySelectorAll("table").forEach(function (table) {
+      if (table.closest(CODE_SELECTOR)) return;
+      var allCells = table.querySelectorAll("td, th");
+      if (allCells.length === 0) return;
+      var rtlCount = 0;
+      allCells.forEach(function (cell) {
+        if (cell.getAttribute("dir") === "rtl") rtlCount++;
+      });
+      if (rtlCount / allCells.length > 0.3) {
+        table.setAttribute("dir", "rtl");
+        table.style.direction = "rtl";
+      }
+    });
+
     root.querySelectorAll("textarea, [contenteditable='true'], [role='textbox']").forEach(function (el) {
       var text = el.value || el.innerText || el.textContent || "";
       var dir = firstStrongDirection(text);
@@ -252,45 +269,12 @@ else
   echo "WARNING: mainView.js not found — skipping preload patch"
 fi
 
-# ─── Target 2: index.html (shell app — co-work sidebar & local UI) ────────────
-#
-# The shell UI (co-work panel, history, sidebar) is served from app://localhost
-# and renders from index.html + main-*.js. Instead of patching the large JS
-# bundle (which would break co-work), we inject a tiny inline <script> into
-# the HTML <head>. The script is deferred until DOMContentLoaded so it runs
-# safely after the shell framework has initialized.
+# index.html (shell UI) is intentionally NOT patched.
+# Injecting into index.html modifies the co-work shell's entry point and
+# triggers its integrity check, causing the "Invalid installation" error.
+# mainView.js (the WebView preload) is sufficient for RTL in chat messages.
 
-INDEX_HTML="$UNPACKED/.vite/renderer/main_window/index.html"
-HTML_PATCHED=0
-
-if [ -f "$INDEX_HTML" ]; then
-  if grep -q "CLAUDE_RTL_HEBREW_PATCH_START" "$INDEX_HTML"; then
-    echo "index.html: already patched, skipping"
-    HTML_PATCHED=1
-  else
-    # Build the inline script block (no backtick template literals so it
-    # embeds cleanly inside double-quoted HTML attributes if needed).
-    INLINE_SCRIPT="<script id=\"claude-rtl-inject\">/* CLAUDE_RTL_HEBREW_PATCH_START */${RTL_JS_SNIPPET}/* CLAUDE_RTL_HEBREW_PATCH_END */</script>"
-
-    # Insert the inline script just before </head>
-    perl -0pi -e 's|</head>|'"$(printf '%s' "$INLINE_SCRIPT" | perl -pe 's|[/\\]|\\$&|g')"'\n</head>|' "$INDEX_HTML" 2>/dev/null || true
-
-    # Verify injection worked
-    if grep -q "CLAUDE_RTL_HEBREW_PATCH_START" "$INDEX_HTML"; then
-      echo "Patched shell HTML: $INDEX_HTML"
-      HTML_PATCHED=1
-    else
-      echo "WARNING: HTML injection failed — falling back to safe append"
-      # Safe fallback: append before </body> instead
-      sed -i '' "s|</body>|<script id=\"claude-rtl-inject-fb\">/* CLAUDE_RTL_HEBREW_PATCH_START */${RTL_JS_SNIPPET}/* CLAUDE_RTL_HEBREW_PATCH_END */</script></body>|" "$INDEX_HTML" || true
-      grep -q "CLAUDE_RTL_HEBREW_PATCH_START" "$INDEX_HTML" && HTML_PATCHED=1
-    fi
-  fi
-else
-  echo "WARNING: index.html not found — skipping shell HTML patch"
-fi
-
-[ "$PRELOAD_PATCHED" -gt 0 ] || [ "$HTML_PATCHED" -gt 0 ] || fail "Nothing was patched"
+[ "$PRELOAD_PATCHED" -gt 0 ] || fail "Nothing was patched"
 
 echo "Packing new app.asar..."
 npx asar pack "$UNPACKED" "$NEW_ASAR" --unpack "{*.node,spawn-helper}"
@@ -335,11 +319,33 @@ find "$APP_PATH" -name "Info.plist" -print0 | while IFS= read -r -d '' PLIST; do
   fi
 done
 
-echo "Re-signing Claude.app deeply..."
-sudo codesign --force --deep --sign - "$APP_PATH"
+# ─── Signing strategy ────────────────────────────────────────────────────────
+#
+# We do NOT re-sign the outer bundle. Here's why every signing approach breaks
+# co-work, and why skipping it is safe:
+#
+# • isVirtualizationSupported() runs inside Claude Helper.app (the Node.js
+#   main process). That helper is signed by Anthropic Developer ID and carries
+#   the com.apple.security.virtualization entitlement.
+#
+# • The helper's code signature has Info.plist=not bound and zero sealed
+#   resource files — updating its Info.plist (which we must do for the ASAR
+#   hash) does NOT invalidate its signature.
+#
+# • Re-signing the outer bundle (even without --deep) regenerates
+#   _CodeSignature/CodeResources. codesign re-processes the helpers, which
+#   already show "invalid Info.plist" under --strict. This produces a
+#   CodeResources that macOS rejects when spawning helpers as utility
+#   processes, causing the entitlement check to fail.
+#
+# • Skipping re-sign is safe because the stub (Claude.app/Contents/MacOS/Claude)
+#   is ad-hoc with NO Hardened Runtime. Without quarantine and without
+#   Hardened Runtime, macOS does not strictly enforce resource hash
+#   verification at each launch. The helpers retain their original, valid
+#   Anthropic Developer ID signatures throughout.
 
-echo "Validating signature..."
-codesign -v "$APP_PATH" 2>/dev/null || true
+echo "Clearing quarantine and extended attributes (no re-sign needed)..."
+sudo xattr -cr "$APP_PATH" 2>/dev/null || true
 
 echo "Launching Claude..."
 open -a Claude
@@ -361,7 +367,6 @@ else
     [ -f "$DEST" ] && sudo cp "$BACKUP_PLIST" "$DEST"
   done
 
-  sudo codesign --force --deep --sign - "$APP_PATH"
-  echo "Restored backup."
+  echo "Restored backup. No re-sign performed on restore."
   exit 1
 fi
